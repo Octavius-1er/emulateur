@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#111827">
+<link rel="icon" href="data:,">
+<title>Octavius — Émulateur de navigateur</title>
+<style>
+:root {
+  --bg: #111827;
+  --bar: #1f2937;
+  --bar-2: #182131;
+  --field: #0f172a;
+  --text: #e5e7eb;
+  --muted: #94a3b8;
+  --line: #334155;
+  --accent: #8b5cf6;
+  --danger: #fb7185;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  overflow: hidden;
+}
+.toolbar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bar);
+  border-bottom: 1px solid var(--line);
+}
+.controls { display: flex; gap: 4px; }
+button {
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text);
+  font-size: 18px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { background: #334155; }
+button:disabled { opacity: .3; cursor: default; }
+button:focus-visible, #url:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+#url {
+  width: 100%;
+  height: 38px;
+  padding: 0 15px;
+  border: 1px solid #374151;
+  border-radius: 20px;
+  background: var(--field);
+  color: var(--text);
+  font: inherit;
+}
+#url::placeholder { color: var(--muted); }
+#newtab { color: #c4b5fd; }
+#load {
+  width: 0;
+  height: 3px;
+  background: var(--accent);
+  transition: width .2s ease, opacity .2s ease;
+  opacity: 0;
+}
+#view {
+  flex: 1;
+  width: 100%;
+  border: 0;
+  background: #fff;
+}
+.statusbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 30px;
+  padding: 5px 10px;
+  background: var(--bar-2);
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+#status { overflow: hidden; text-overflow: ellipsis; }
+#engine { font-size: 12px; }
+.err { color: var(--danger); }
+@media (max-width: 700px) {
+  .toolbar { grid-template-columns: 1fr; }
+  .controls { justify-content: center; }
+  #newtab { display: none; }
+}
+</style>
+</head>
+<body>
+<form class="toolbar" id="form" autocomplete="off">
+  <div class="controls" aria-label="Navigation">
+    <button type="button" id="back" title="Précédent" aria-label="Précédent" disabled>←</button>
+    <button type="button" id="fwd" title="Suivant" aria-label="Suivant" disabled>→</button>
+    <button type="button" id="reload" title="Recharger" aria-label="Recharger">↻</button>
+    <button type="button" id="home" title="Accueil" aria-label="Accueil">⌂</button>
+  </div>
+  <input id="url" type="text" placeholder="Adresse ou recherche…" spellcheck="false" autofocus>
+  <button type="button" id="newtab" title="Nouvelle page" aria-label="Nouvelle page">＋</button>
+</form>
+<div id="load"></div>
+<iframe
+  id="view"
+  title="Page affichée par l'émulateur"
+  sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-presentation"
+  allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
+  referrerpolicy="no-referrer"
+></iframe>
+<div class="statusbar">
+  <span id="status">Prêt — tape une adresse ou une recherche.</span>
+  <span id="engine">Proxy Octavius</span>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const HOME = 'https://html.duckduckgo.com/html/?q=';
+let historyStack = [];
+let historyIndex = -1;
+let currentRequest = 0;
+
+function setStatus(message, error = false) {
+  $('status').textContent = message;
+  $('status').className = error ? 'err' : '';
+}
+
+function normalizeInput(value) {
+  const text = value.trim();
+  if (!text) return null;
+  if (/^https?:\/\//i.test(text)) return text;
+  if (/^www\./i.test(text)) return 'https://' + text;
+  if (!/\s/.test(text) && /^[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?(?:\/.*)?$/i.test(text)) {
+    return 'https://' + text;
+  }
+  return HOME + encodeURIComponent(text);
+}
+
+function updateButtons() {
+  $('back').disabled = historyIndex <= 0;
+  $('fwd').disabled = historyIndex < 0 || historyIndex >= historyStack.length - 1;
+}
+
+function beginLoading() {
+  $('load').style.opacity = '1';
+  $('load').style.width = '70%';
+}
+
+function endLoading(ok = true) {
+  $('load').style.width = '100%';
+  if (!ok) $('load').style.background = 'var(--danger)';
+  setTimeout(() => {
+    $('load').style.opacity = '0';
+    $('load').style.width = '0';
+    $('load').style.background = 'var(--accent)';
+  }, 250);
+}
+
+async function fetchDocument(targetUrl) {
+  const endpoint = '/api/proxy?mode=document&url=' + encodeURIComponent(targetUrl);
+  const response = await fetch(endpoint, {
+    credentials: 'same-origin',
+    headers: { 'Accept': 'application/json' },
+    cache: 'no-store'
+  });
+
+  const type = response.headers.get('content-type') || '';
+  if (!type.includes('application/json')) {
+    const text = await response.text();
+    throw new Error('Le proxy a renvoyé une réponse inattendue (' + response.status + '). ' + text.slice(0, 120));
+  }
+
+  const data = await response.json();
+  if (!response.ok || data.erreur) throw new Error(data.erreur || ('HTTP ' + response.status));
+  if (typeof data.html !== 'string') throw new Error('Réponse du proxy incomplète.');
+  return data;
+}
+
+async function load(targetUrl, { push = true, keepFocus = false } = {}) {
+  const requestId = ++currentRequest;
+  beginLoading();
+  setStatus('Chargement de ' + targetUrl + '…');
+
+  try {
+    const data = await fetchDocument(targetUrl);
+    if (requestId !== currentRequest) return;
+
+    $('view').srcdoc = data.html;
+    $('url').value = data.url;
+    setStatus('Page chargée (HTTP ' + data.statut + ')');
+
+    if (push) {
+      historyStack = historyStack.slice(0, historyIndex + 1);
+      historyStack.push(data.url);
+      historyIndex++;
+    }
+    updateButtons();
+    endLoading(true);
+    if (keepFocus) $('url').focus();
+  } catch (error) {
+    if (requestId !== currentRequest) return;
+    setStatus('Erreur : ' + (error?.message || error), true);
+    endLoading(false);
+    updateButtons();
+  }
+}
+
+$('form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const target = normalizeInput($('url').value);
+  if (target) load(target, { push: true, keepFocus: false });
+});
+
+$('back').addEventListener('click', () => {
+  if (historyIndex <= 0) return;
+  historyIndex--;
+  load(historyStack[historyIndex], { push: false });
+  updateButtons();
+});
+
+$('fwd').addEventListener('click', () => {
+  if (historyIndex >= historyStack.length - 1) return;
+  historyIndex++;
+  load(historyStack[historyIndex], { push: false });
+  updateButtons();
+});
+
+$('reload').addEventListener('click', () => {
+  if (historyStack[historyIndex]) load(historyStack[historyIndex], { push: false });
+});
+
+$('home').addEventListener('click', () => {
+  $('url').value = '';
+  $('url').focus();
+  $('view').srcdoc = '<!doctype html><html lang="fr"><head><meta charset="utf-8"><style>body{font:16px system-ui;margin:40px;color:#334155}h1{margin-bottom:8px}</style></head><body><h1>Octavius</h1><p>Entre une adresse Web ou une recherche dans la barre ci-dessus.</p></body></html>';
+  setStatus('Prêt — tape une adresse ou une recherche.');
+});
+
+$('newtab').addEventListener('click', () => {
+  $('url').value = '';
+  $('url').focus();
+});
+
+window.addEventListener('message', (event) => {
+  if (event.source !== $('view').contentWindow) return;
+  const data = event.data;
+  if (!data || typeof data.url !== 'string') return;
+  if (data.type === 'navigate') {
+    load(data.url, { push: true });
+  }
+});
+
+updateButtons();
+</script>
+</body>
+</html>
