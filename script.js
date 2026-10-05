@@ -1,681 +1,344 @@
-"use strict";
+const frame = document.getElementById("browser-frame");
+const addressBar = document.getElementById("address-bar");
+const progressBar = document.getElementById("progress-bar");
 
-/*
-==================================================
-OCTAVIUS
-Navigation + recherche automatique
-==================================================
-*/
-
-const addressInput =
-  document.getElementById("address");
-
-const navigationForm =
-  document.getElementById("navigation-form");
-
-const browserFrame =
-  document.getElementById("browser-frame");
-
-const backButton =
-  document.getElementById("back");
-
-const forwardButton =
-  document.getElementById("forward");
-
-const reloadButton =
-  document.getElementById("reload");
-
-const homeButton =
-  document.getElementById("home");
-
-const statusElement =
-  document.getElementById("status");
-
-const progressElement =
-  document.getElementById("progress");
-
-
-/* ==================================================
-   CONFIGURATION
-   ================================================== */
+const backButton = document.getElementById("back-button");
+const forwardButton = document.getElementById("forward-button");
+const reloadButton = document.getElementById("reload-button");
+const homeButton = document.getElementById("home-button");
 
 const PROXY_ENDPOINT = "/api/proxy";
+const SEARCH_ENGINE = "https://www.google.com/search?hl=fr&q=";
 
-/*
-  Quand l'utilisateur écrit simplement :
-  youtube
-  roblox
-  snapchat
-
-  on fait automatiquement une recherche Google.
-*/
-const SEARCH_ENGINE =
-  "https://www.google.com/search?hl=fr&q=";
-
-
-/* ==================================================
-   HISTORIQUE
-   ================================================== */
-
-let historyList = [];
+let historyStack = [];
 let historyIndex = -1;
+let loadingFromHistory = false;
 
-let currentRequestId = 0;
-
-
-/* ==================================================
-   INTERFACE
-   ================================================== */
-
-function setStatus(message, isError = false) {
-  statusElement.textContent = message;
-
-  statusElement.classList.toggle(
-    "error",
-    isError
-  );
+function isHttpUrl(value) {
+    return /^https?:\/\//i.test(value);
 }
 
-
-function setLoading(loading) {
-  if (loading) {
-    progressElement.style.opacity = "1";
-    progressElement.style.width = "70%";
-  } else {
-    progressElement.style.width = "100%";
-
-    setTimeout(() => {
-      progressElement.style.opacity = "0";
-      progressElement.style.width = "0";
-    }, 200);
-  }
+function looksLikeDomain(value) {
+    return /^[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?(?:\/.*)?$/i.test(value);
 }
 
+function normalizeAddress(input) {
+    let value = input.trim();
 
-function updateHistoryButtons() {
-  backButton.disabled =
-    historyIndex <= 0;
+    if (!value) {
+        return null;
+    }
 
-  forwardButton.disabled =
-    historyIndex < 0 ||
-    historyIndex >= historyList.length - 1;
+    if (isHttpUrl(value)) {
+        return value;
+    }
+
+    if (/^www\./i.test(value)) {
+        return "https://" + value;
+    }
+
+    if (looksLikeDomain(value)) {
+        return "https://" + value;
+    }
+
+    return SEARCH_ENGINE + encodeURIComponent(value);
 }
 
-
-/* ==================================================
-   DÉTECTION URL / RECHERCHE
-   ================================================== */
-
-function normalizeAddress(value) {
-  value = String(value || "").trim();
-
-  if (!value) {
-    return null;
-  }
-
-
-  /*
-   * URL complète :
-   * https://youtube.com
-   */
-  if (/^https?:\/\//i.test(value)) {
-    return value;
-  }
-
-
-  /*
-   * www.youtube.com
-   */
-  if (/^www\./i.test(value)) {
-    return "https://" + value;
-  }
-
-
-  /*
-   * youtube.com
-   * roblox.com/games
-   */
-  if (
-    !/\s/.test(value) &&
-    /^[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?(?:\/.*)?$/i.test(value)
-  ) {
-    return "https://" + value;
-  }
-
-
-  /*
-   * Tout le reste devient
-   * une recherche Google.
-   *
-   * Exemples :
-   * youtube
-   * roblox
-   * snapchat
-   * chatgpt
-   * comment faire une carte mentale
-   */
-  return (
-    SEARCH_ENGINE +
-    encodeURIComponent(value)
-  );
-}
-
-
-/* ==================================================
-   CONSTRUCTION URL PROXY
-   ================================================== */
-
-function buildProxyUrl(targetUrl, mode) {
-  return (
-    PROXY_ENDPOINT +
-    "?mode=" +
-    encodeURIComponent(mode) +
-    "&url=" +
-    encodeURIComponent(targetUrl)
-  );
-}
-
-
-/* ==================================================
-   CHARGEMENT D'UNE PAGE
-   ================================================== */
-
-async function loadPage(
-  targetUrl,
-  options = {}
-) {
-  const {
-    addToHistory = true
-  } = options;
-
-  const requestId =
-    ++currentRequestId;
-
-  setLoading(true);
-
-  setStatus(
-    "Chargement de " +
-    targetUrl +
-    "..."
-  );
-
-  try {
-
-    /*
-     * Étape 1 :
-     * demander les informations de la page
-     * au proxy.
-     */
-
-    const response =
-      await fetch(
-        buildProxyUrl(
-          targetUrl,
-          "document"
-        ),
-        {
-          method: "GET",
-          cache: "no-store",
-          credentials: "same-origin",
-
-          headers: {
-            "Accept":
-              "application/json"
-          }
-        }
-      );
-
-
-    /*
-     * Une navigation plus récente
-     * a commencé.
-     */
-
-    if (
-      requestId !==
-      currentRequestId
-    ) {
-      return;
-    }
-
-
-    /*
-     * Vérifie que le proxy a réellement
-     * envoyé du JSON.
-     */
-
-    const contentType =
-      response.headers.get(
-        "content-type"
-      ) || "";
-
-
-    if (
-      !contentType.includes(
-        "application/json"
-      )
-    ) {
-      throw new Error(
-        "Réponse inattendue du proxy (" +
-        response.status +
-        ")"
-      );
-    }
-
-
-    const data =
-      await response.json();
-
-
-    if (
-      requestId !==
-      currentRequestId
-    ) {
-      return;
-    }
-
-
-    /*
-     * Erreur du proxy.
-     */
-
-    if (
-      !response.ok ||
-      data.erreur
-    ) {
-      throw new Error(
-        data.erreur ||
-        (
-          "Erreur HTTP " +
-          response.status
-        )
-      );
-    }
-
-
-    /*
-     * Étape 2 :
-     * afficher la page dans l'iframe.
-     */
-
-    browserFrame.src =
-      buildProxyUrl(
-        data.url,
-        "frame"
-      );
-
-
-    /*
-     * Met à jour la barre d'adresse.
-     */
-
-    addressInput.value =
-      data.url;
-
-
-    /*
-     * Historique.
-     */
-
-    if (addToHistory) {
-
-      historyList =
-        historyList.slice(
-          0,
-          historyIndex + 1
-        );
-
-      historyList.push(
-        data.url
-      );
-
-      historyIndex++;
-    }
-
-
-    updateHistoryButtons();
-
-
-    setStatus(
-      "Page chargée — HTTP " +
-      data.statut
+function buildProxyUrl(targetUrl, mode = "frame") {
+    return (
+        PROXY_ENDPOINT +
+        "?mode=" +
+        encodeURIComponent(mode) +
+        "&url=" +
+        encodeURIComponent(targetUrl)
     );
-
-    setLoading(false);
-
-  } catch (error) {
-
-    if (
-      requestId !==
-      currentRequestId
-    ) {
-      return;
-    }
-
-    setLoading(false);
-
-    setStatus(
-      "Erreur : " +
-      (
-        error?.message ||
-        String(error)
-      ),
-      true
-    );
-  }
 }
 
+function setProgress(value) {
+    if (!progressBar) return;
 
-/* ==================================================
-   BARRE D'ADRESSE
-   ================================================== */
+    progressBar.style.width = value + "%";
 
-navigationForm.addEventListener(
-  "submit",
-  (event) => {
+    if (value >= 100) {
+        setTimeout(() => {
+            progressBar.style.width = "0%";
+        }, 250);
+    }
+}
 
-    event.preventDefault();
+function updateButtons() {
+    if (backButton) {
+        backButton.disabled = historyIndex <= 0;
+    }
 
-    const targetUrl =
-      normalizeAddress(
-        addressInput.value
-      );
+    if (forwardButton) {
+        forwardButton.disabled =
+            historyIndex < 0 || historyIndex >= historyStack.length - 1;
+    }
+}
+
+function setAddress(url) {
+    if (addressBar) {
+        addressBar.value = url;
+    }
+}
+
+function addToHistory(url) {
+    if (loadingFromHistory) {
+        loadingFromHistory = false;
+        return;
+    }
+
+    if (historyIndex >= 0 && historyStack[historyIndex] === url) {
+        updateButtons();
+        return;
+    }
+
+    historyStack = historyStack.slice(0, historyIndex + 1);
+    historyStack.push(url);
+    historyIndex = historyStack.length - 1;
+
+    updateButtons();
+}
+
+function getInitialUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const requested = params.get("url");
+
+    if (requested) {
+        return requested;
+    }
+
+    return "https://www.google.com/";
+}
+
+function showError(message) {
+    frame.srcdoc = `
+        <!DOCTYPE html>
+        <html lang="fr">
+        <head>
+            <meta charset="UTF-8">
+            <title>Octavius - Erreur</title>
+            <style>
+                body {
+                    margin: 0;
+                    background: #111827;
+                    color: #e5e7eb;
+                    font-family: Arial, sans-serif;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    min-height: 100vh;
+                }
+
+                .box {
+                    max-width: 700px;
+                    padding: 30px;
+                    text-align: center;
+                }
+
+                h1 {
+                    margin-bottom: 12px;
+                }
+
+                p {
+                    color: #9ca3af;
+                    line-height: 1.6;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="box">
+                <h1>Impossible de charger cette page</h1>
+                <p>${escapeHtml(message)}</p>
+            </div>
+        </body>
+        </html>
+    `;
+}
+
+function escapeHtml(value) {
+    return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+function loadPage(rawUrl, options = {}) {
+    const {
+        addHistory = true
+    } = options;
+
+    const targetUrl = normalizeAddress(rawUrl);
 
     if (!targetUrl) {
-      return;
+        return;
     }
 
-    loadPage(targetUrl);
-  }
-);
+    setProgress(15);
+    setAddress(targetUrl);
 
+    if (addHistory) {
+        addToHistory(targetUrl);
+    }
 
-/* ==================================================
-   BOUTON PRÉCÉDENT
-   ================================================== */
+    const proxyUrl = buildProxyUrl(targetUrl, "frame");
 
-backButton.addEventListener(
-  "click",
-  () => {
+    frame.onload = () => {
+        setProgress(100);
+    };
 
-    if (
-      historyIndex <= 0
-    ) {
-      return;
+    frame.onerror = () => {
+        setProgress(0);
+        showError("Le proxy n’a pas réussi à charger cette page.");
+    };
+
+    frame.src = proxyUrl;
+}
+
+function goBack() {
+    if (historyIndex <= 0) {
+        return;
     }
 
     historyIndex--;
+    loadingFromHistory = true;
 
-    const targetUrl =
-      historyList[
-        historyIndex
-      ];
+    const url = historyStack[historyIndex];
 
-    updateHistoryButtons();
+    updateButtons();
+    setAddress(url);
+    loadPage(url, { addHistory: false });
+}
 
-    loadPage(
-      targetUrl,
-      {
-        addToHistory: false
-      }
-    );
-  }
-);
-
-
-/* ==================================================
-   BOUTON SUIVANT
-   ================================================== */
-
-forwardButton.addEventListener(
-  "click",
-  () => {
-
-    if (
-      historyIndex >=
-      historyList.length - 1
-    ) {
-      return;
+function goForward() {
+    if (historyIndex >= historyStack.length - 1) {
+        return;
     }
 
     historyIndex++;
+    loadingFromHistory = true;
 
-    const targetUrl =
-      historyList[
-        historyIndex
-      ];
+    const url = historyStack[historyIndex];
 
-    updateHistoryButtons();
+    updateButtons();
+    setAddress(url);
+    loadPage(url, { addHistory: false });
+}
 
-    loadPage(
-      targetUrl,
-      {
-        addToHistory: false
-      }
-    );
-  }
-);
-
-
-/* ==================================================
-   RECHARGER
-   ================================================== */
-
-reloadButton.addEventListener(
-  "click",
-  () => {
-
-    if (
-      historyIndex < 0
-    ) {
-      return;
+function reloadPage() {
+    if (!frame.src) {
+        loadPage(getInitialUrl());
+        return;
     }
 
-    const targetUrl =
-      historyList[
-        historyIndex
-      ];
+    setProgress(20);
 
-    loadPage(
-      targetUrl,
-      {
-        addToHistory: false
-      }
-    );
-  }
-);
+    try {
+        const current = new URL(frame.src, window.location.origin);
+        const proxiedTarget = current.searchParams.get("url");
 
+        if (proxiedTarget) {
+            frame.src = buildProxyUrl(proxiedTarget, "frame");
+        } else {
+            frame.src = frame.src;
+        }
+    } catch {
+        frame.src = frame.src;
+    }
+}
 
-/* ==================================================
-   ACCUEIL
-   ================================================== */
+function goHome() {
+    loadPage("https://www.google.com/");
+}
 
-homeButton.addEventListener(
-  "click",
-  () => {
+function handleAddressSubmit() {
+    if (!addressBar) return;
 
-    browserFrame.removeAttribute(
-      "src"
-    );
+    const value = addressBar.value.trim();
 
-    addressInput.value = "";
-
-    setStatus("Prêt.");
-
-    setLoading(false);
-  }
-);
-
-
-/* ==================================================
-   NAVIGATION DEPUIS UNE PAGE
-   ==================================================
-
-   Le proxy injecte un petit bridge
-   qui envoie :
-
-   {
-     type: "navigate",
-     url: "..."
-   }
-
-   à Octavius.
-   ================================================== */
-
-window.addEventListener(
-  "message",
-  (event) => {
-
-    /*
-     * On accepte uniquement les messages
-     * provenant de notre iframe.
-     */
-
-    if (
-      event.source !==
-      browserFrame.contentWindow
-    ) {
-      return;
+    if (!value) {
+        return;
     }
 
+    loadPage(value);
+}
 
-    const message =
-      event.data;
+if (addressBar) {
+    addressBar.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+            event.preventDefault();
+            handleAddressSubmit();
+        }
+    });
 
+    addressBar.addEventListener("focus", () => {
+        addressBar.select();
+    });
+}
 
-    if (
-      !message ||
-      typeof message !== "object"
-    ) {
-      return;
+if (backButton) {
+    backButton.addEventListener("click", goBack);
+}
+
+if (forwardButton) {
+    forwardButton.addEventListener("click", goForward);
+}
+
+if (reloadButton) {
+    reloadButton.addEventListener("click", reloadPage);
+}
+
+if (homeButton) {
+    homeButton.addEventListener("click", goHome);
+}
+
+window.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "l") {
+        event.preventDefault();
+
+        if (addressBar) {
+            addressBar.focus();
+            addressBar.select();
+        }
     }
 
-
-    if (
-      message.type !==
-      "navigate"
-    ) {
-      return;
+    if (event.altKey && event.key === "ArrowLeft") {
+        event.preventDefault();
+        goBack();
     }
 
-
-    if (
-      typeof message.url !==
-      "string"
-    ) {
-      return;
+    if (event.altKey && event.key === "ArrowRight") {
+        event.preventDefault();
+        goForward();
     }
 
-
-    loadPage(
-      message.url
-    );
-  }
-);
-
-
-/* ==================================================
-   IFRAME CHARGÉ
-   ================================================== */
-
-browserFrame.addEventListener(
-  "load",
-  () => {
-
-    setLoading(false);
-
-    if (
-      historyIndex >= 0
-    ) {
-      setStatus(
-        "Page affichée."
-      );
+    if (event.key === "F5") {
+        event.preventDefault();
+        reloadPage();
     }
-  }
-);
+});
 
-
-/* ==================================================
-   RACCOURCIS CLAVIER
-   ================================================== */
-
-/*
-   Ctrl + L
-   → sélectionner la barre d'adresse
-*/
-
-document.addEventListener(
-  "keydown",
-  (event) => {
-
-    if (
-      event.ctrlKey &&
-      event.key.toLowerCase() === "l"
-    ) {
-
-      event.preventDefault();
-
-      addressInput.focus();
-      addressInput.select();
-
-      return;
+window.addEventListener("message", (event) => {
+    if (!event.data || typeof event.data !== "object") {
+        return;
     }
 
-
-    /*
-     * Alt + ←
-     */
-
-    if (
-      event.altKey &&
-      event.key === "ArrowLeft"
-    ) {
-
-      event.preventDefault();
-
-      backButton.click();
-
-      return;
+    if (event.data.type === "octavius:navigate") {
+        if (typeof event.data.url === "string") {
+            loadPage(event.data.url);
+        }
     }
+});
 
+window.addEventListener("load", () => {
+    const initialUrl = getInitialUrl();
 
-    /*
-     * Alt + →
-     */
+    historyStack = [];
+    historyIndex = -1;
 
-    if (
-      event.altKey &&
-      event.key === "ArrowRight"
-    ) {
-
-      event.preventDefault();
-
-      forwardButton.click();
-
-      return;
-    }
-
-
-    /*
-     * F5
-     */
-
-    if (
-      event.key === "F5"
-    ) {
-
-      event.preventDefault();
-
-      reloadButton.click();
-    }
-  }
-);
-
-
-/* ==================================================
-   DÉMARRAGE
-   ================================================== */
-
-updateHistoryButtons();
-
-setStatus("Prêt.");
+    loadPage(initialUrl);
+    updateButtons();
+});
