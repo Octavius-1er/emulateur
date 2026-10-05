@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Émulateur de navigateur</title>
+<style>
+:root{--bg:#1e2533;--bar:#2b3447;--ink:#e8edf6;--acc:#ff5d8f}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{display:flex;flex-direction:column;background:var(--bg);color:var(--ink);font:15px system-ui,Segoe UI,Roboto,sans-serif}
+.bar{display:flex;gap:8px;align-items:center;padding:10px;background:var(--bar)}
+.bar button{width:38px;height:38px;border:0;border-radius:50%;background:transparent;color:var(--ink);font-size:18px;cursor:pointer}
+.bar button:hover:not(:disabled){background:#3b4660}
+.bar button:disabled{opacity:.3;cursor:default}
+.bar button:focus-visible,#url:focus-visible{outline:3px solid var(--acc);outline-offset:1px}
+#url{flex:1;min-width:0;height:38px;padding:0 16px;border:0;border-radius:19px;background:#151b27;color:var(--ink);font:inherit}
+#load{height:3px;background:var(--acc);width:0;transition:width .4s}
+#view{flex:1;width:100%;border:0;background:#fff}
+#status{padding:6px 12px;font-size:13px;background:var(--bar);color:#aab6cc;min-height:30px}
+.err{color:#ffb4c8}
+</style>
+</head>
+<body>
+<form class="bar" id="form">
+  <button type="button" id="back" aria-label="Page précédente" disabled>&#8592;</button>
+  <button type="button" id="fwd" aria-label="Page suivante" disabled>&#8594;</button>
+  <button type="button" id="reload" aria-label="Recharger">&#8635;</button>
+  <input id="url" type="text" placeholder="Tape une adresse ou une recherche" aria-label="Adresse" autocomplete="off" autofocus>
+</form>
+<div id="load"></div>
+<iframe id="view" sandbox="allow-scripts" title="Page affichée par l'émulateur"></iframe>
+<div id="status">Tape une adresse (ex : fr.wikipedia.org) ou une recherche.</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let hist = [], pos = -1;
+
+function clean(t) {
+  t = t.trim();
+  if (/^https?:\/\//i.test(t)) return t;
+  if (!/\s/.test(t) && t.includes('.')) return 'https://' + t;
+  return 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(t);
+}
+
+async function load(url, push = true) {
+  $('load').style.width = '70%';
+  $('status').className = '';
+  $('status').textContent = 'Chargement de ' + url + '...';
+  try {
+    const r = await fetch('/api/proxy?url=' + encodeURIComponent(url));
+    const d = await r.json();
+    if (d.erreur) throw new Error(d.erreur);
+    $('view').srcdoc = d.html;
+    $('url').value = d.url;
+    $('status').textContent = 'Page chargée (code ' + d.statut + ')';
+    if (push) { hist = hist.slice(0, pos + 1); hist.push(d.url); pos++; }
+  } catch (e) {
+    $('status').className = 'err';
+    $('status').textContent = 'Erreur : ' + e.message;
+  }
+  $('load').style.width = '100%';
+  setTimeout(() => $('load').style.width = '0', 400);
+  $('back').disabled = pos <= 0;
+  $('fwd').disabled = pos >= hist.length - 1;
+}
+
+$('form').onsubmit = e => { e.preventDefault(); if ($('url').value.trim()) load(clean($('url').value)); };
+$('back').onclick = () => { if (pos > 0) { pos--; load(hist[pos], false); } };
+$('fwd').onclick = () => { if (pos < hist.length - 1) { pos++; load(hist[pos], false); } };
+$('reload').onclick = () => { if (hist[pos]) load(hist[pos], false); };
+
+// Les clics dans la page affichée remontent ici
+window.addEventListener('message', e => {
+  if (e.source === $('view').contentWindow && e.data && typeof e.data.go === 'string') load(e.data.go);
+});
+</script>
+</body>
+</html>
