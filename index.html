@@ -229,14 +229,67 @@
         width: 100%;
       }
     }
+
+    [hidden] { display: none !important; }
+
+    #youtube-frame {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      border: none;
+      background: #000;
+    }
+
+    #login {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(15, 23, 42, 0.97);
+    }
+
+    .login-box {
+      width: min(340px, 90vw);
+      padding: 24px;
+      border: 1px solid var(--toolbar-border);
+      border-radius: 12px;
+      background: var(--toolbar);
+    }
+
+    .login-box h2 { margin: 0 0 8px; }
+    .login-box p { margin: 0 0 12px; color: var(--muted); }
+
+    .login-box input {
+      width: 100%;
+      height: 40px;
+      margin-bottom: 10px;
+      padding: 0 14px;
+      border: 1px solid #344158;
+      border-radius: 8px;
+      background: var(--input);
+      color: var(--text);
+      font-size: 15px;
+    }
+
+    .login-box button {
+      width: 100%;
+      height: 40px;
+      border: 0;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    #login-error { margin-top: 10px; color: var(--error); min-height: 1em; }
   </style>
 </head>
 
 <body>
-
-  <!-- =========================
-       BARRE DU NAVIGATEUR
-       ========================= -->
 
   <form
     id="navigation-form"
@@ -300,27 +353,12 @@
 
   </form>
 
-  <!-- =========================
-       CHARGEMENT
-       ========================= -->
-
   <div id="progress"></div>
-
-  <!-- =========================
-       PAGE WEB
-       ========================= -->
 
   <iframe
     id="browser-frame"
     title="Octavius Browser"
-    sandbox="
-      allow-scripts
-      allow-forms
-      allow-popups
-      allow-modals
-      allow-presentation
-      allow-downloads
-    "
+    sandbox="allow-scripts allow-forms allow-presentation"
     allow="
       autoplay;
       fullscreen;
@@ -331,9 +369,14 @@
     "
   ></iframe>
 
-  <!-- =========================
-       BARRE D'ÉTAT
-       ========================= -->
+  <iframe
+    id="youtube-frame"
+    hidden
+    title="Lecteur YouTube"
+    referrerpolicy="strict-origin-when-cross-origin"
+    allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
+    allowfullscreen
+  ></iframe>
 
   <div class="status-bar">
 
@@ -347,9 +390,15 @@
 
   </div>
 
-  <!-- =========================
-       JAVASCRIPT
-       ========================= -->
+  <form id="login" hidden>
+    <div class="login-box">
+      <h2>Accès protégé</h2>
+      <p>Entre le code d'accès.</p>
+      <input id="login-code" type="password" autocomplete="off" aria-label="Code d'accès">
+      <button type="submit">Entrer</button>
+      <p id="login-error" role="alert"></p>
+    </div>
+  </form>
 
   <script src="/script.js" defer></script>
 
