@@ -1,858 +1,1002 @@
-const dns = require("dns").promises;
+"use strict";
 
-const BLOCKED_HEADERS = new Set([
-    "content-security-policy",
-    "content-security-policy-report-only",
-    "x-frame-options",
-    "cross-origin-opener-policy",
-    "cross-origin-embedder-policy",
-    "cross-origin-resource-policy"
-]);
+const dns = require("node:dns").promises;
+const crypto = require("node:crypto");
 
-function setCors(req, res) {
-    const origin = req.headers?.origin;
-
-    if (origin) {
-        res.setHeader("Access-Control-Allow-Origin", origin);
-        res.setHeader("Vary", "Origin");
-    } else {
-        res.setHeader("Access-Control-Allow-Origin", "*");
-    }
-
-    res.setHeader(
-        "Access-Control-Allow-Methods",
-        "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-    );
-
-    res.setHeader(
-        "Access-Control-Allow-Headers",
-        "Content-Type, Authorization, X-Requested-With, Accept, Origin"
-    );
-
-    res.setHeader(
-        "Access-Control-Allow-Credentials",
-        "true"
-    );
+function httpError(status, message) {
+  const e = new Error(message);
+  e.status = status;
+  return e;
 }
 
-function isPrivateIPv4(ip) {
-    const p = ip.split(".").map(Number);
+function tokenFor(code) {
+  return crypto.createHash("sha256").update("octavius:" + code).digest("hex").slice(0, 32);
+}
 
-    if (p.length !== 4 || p.some(Number.isNaN)) {
-        return true;
+const TOKEN = process.env.ACCESS_CODE ? tokenFor(process.env.ACCESS_CODE) : "";
+
+function sameToken(a, b) {
+  return a.length === b.length && a.length > 0 &&
+    crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+function checkAccess(req) {
+  if (!TOKEN) {
+    if (process.env.VERCEL) {
+      throw httpError(503, "Définis la variable ACCESS_CODE dans Vercel (Settings > Environment Variables), puis redéploie.");
     }
+    return;
+  }
+  const k = Array.isArray(req.query?.k) ? req.query.k[0] : req.query?.k;
+  if (!sameToken(String(k || ""), TOKEN)) throw httpError(401, "Code d'accès requis");
+}
 
-    const [a, b] = p;
+const TIMEOUT_MS = 25000;
+const MAX_DOCUMENT_SIZE = 8 * 1024 * 1024;
+const MAX_RESOURCE_SIZE = 20 * 1024 * 1024;
 
-    return (
-        a === 10 ||
-        a === 127 ||
-        a === 0 ||
-        (a === 169 && b === 254) ||
-        (a === 172 && b >= 16 && b <= 31) ||
-        (a === 192 && b === 168)
-    );
+const PRIVATE_IPV4 = [
+  /^127\./, /^10\./, /^192\.168\./, /^169\.254\./,
+  /^172\.(1[6-9]|2\d|3[01])\./, /^0\./,
+  /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./,
+  /^192\.0\.0\./, /^198\.1[89]\./, /^(22[4-9]|2[3-5]\d)\./
+];
+
+function isPrivateIPv4(ip) {
+  return PRIVATE_IPV4.some((r) => r.test(ip));
 }
 
 function isPrivateIPv6(ip) {
-    const x = String(ip).toLowerCase();
-
-    return (
-        x === "::" ||
-        x === "::1" ||
-        x.startsWith("fc") ||
-        x.startsWith("fd") ||
-        x.startsWith("fe80:")
-    );
+  const v = String(ip || "").toLowerCase().replace(/^\[|\]$/g, "");
+  const mapped = v.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped) return isPrivateIPv4(mapped[1]);
+  if (/^::ffff:[0-9a-f]{1,4}:[0-9a-f]{1,4}$/.test(v)) return true;
+  return v === "::" || v === "::1" || /^f[cd]/.test(v) || /^fe[89ab]/.test(v) || v.startsWith("ff");
 }
 
-async function checkHost(hostname) {
-    const host = hostname.toLowerCase();
+async function checkPublicHost(hostname) {
+  const host = String(hostname || "")
+    .trim()
+    .toLowerCase();
+
+  if (
+    !host ||
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local")
+  ) {
+    throw new Error("Adresse locale refusée");
+  }
+
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
+    if (isPrivateIPv4(host)) {
+      throw new Error("Adresse privée refusée");
+    }
+    return;
+  }
+
+  if (host.includes(":") && isPrivateIPv6(host)) {
+    throw new Error("Adresse privée refusée");
+  }
+
+  const addresses = await dns.lookup(host, {
+    all: true,
+    verbatim: true
+  });
+
+  if (!addresses.length) {
+    throw new Error("Hôte introuvable");
+  }
+
+  for (const address of addresses) {
+    if (
+      address.family === 4 &&
+      isPrivateIPv4(address.address)
+    ) {
+      throw new Error("Adresse privée refusée");
+    }
 
     if (
-        host === "localhost" ||
-        host.endsWith(".localhost") ||
-        host.endsWith(".local") ||
-        host.endsWith(".internal")
+      address.family === 6 &&
+      isPrivateIPv6(address.address)
     ) {
-        throw new Error("Host interdit");
+      throw new Error("Adresse privée refusée");
     }
-
-    const records = await dns.lookup(host, {
-        all: true
-    });
-
-    if (!records.length) {
-        throw new Error("DNS introuvable");
-    }
-
-    for (const record of records) {
-        if (record.family === 4 && isPrivateIPv4(record.address)) {
-            throw new Error("Adresse privée interdite");
-        }
-
-        if (record.family === 6 && isPrivateIPv6(record.address)) {
-            throw new Error("Adresse IPv6 privée interdite");
-        }
-    }
+  }
 }
 
 function absoluteUrl(value, base) {
-    try {
-        return new URL(value, base).href;
-    } catch {
-        return null;
-    }
-}
+  try {
+    const text = String(value || "").trim();
 
-function proxyUrl(target, mode = "resource") {
-    return (
-        "/api/proxy?mode=" +
-        encodeURIComponent(mode) +
-        "&url=" +
-        encodeURIComponent(target)
-    );
-}
-
-function rewriteUrl(value, base, mode = "resource") {
-    if (!value) {
-        return value;
-    }
-
-    const v = value.trim();
+    if (!text) return null;
 
     if (
-        v.startsWith("#") ||
-        v.startsWith("data:") ||
-        v.startsWith("blob:") ||
-        v.startsWith("javascript:") ||
-        v.startsWith("mailto:") ||
-        v.startsWith("tel:")
+      /^(data:|blob:|javascript:|mailto:|tel:|about:|#)/i.test(text)
     ) {
-        return value;
+      return null;
     }
 
-    const absolute = absoluteUrl(v, base);
-
-    if (!absolute) {
-        return value;
-    }
-
-    return proxyUrl(absolute, mode);
+    return new URL(text, base).href;
+  } catch {
+    return null;
+  }
 }
 
-function rewriteSrcset(value, base) {
-    return value
+function proxyUrl(origin, mode, target) {
+  return (
+    origin + "/api/proxy?mode=" + encodeURIComponent(mode) +
+    "&url=" + encodeURIComponent(target) +
+    (TOKEN ? "&k=" + TOKEN : "")
+  );
+}
+
+function rewriteAttribute(
+  html,
+  tag,
+  attribute,
+  baseUrl,
+  origin,
+  mode = "resource"
+) {
+  const regex = new RegExp(
+    "(<" +
+      tag +
+      "\\b[^>]*\\b" +
+      attribute +
+      "\\s*=\\s*)([\"'])(.*?)(\\2)",
+    "gis"
+  );
+
+  return html.replace(
+    regex,
+    (match, prefix, quote, value) => {
+      const target = absoluteUrl(value, baseUrl);
+
+      if (!target) {
+        return match;
+      }
+
+      return (
+        prefix +
+        quote +
+        proxyUrl(origin, mode, target) +
+        quote
+      );
+    }
+  );
+}
+
+function rewriteSrcset(
+  html,
+  tag,
+  baseUrl,
+  origin
+) {
+  const regex = new RegExp(
+    "(<" +
+      tag +
+      "\\b[^>]*\\bsrcset\\s*=\\s*)([\"'])(.*?)(\\2)",
+    "gis"
+  );
+
+  return html.replace(
+    regex,
+    (match, prefix, quote, value) => {
+      const rewritten = value
         .split(",")
-        .map((part) => {
-            const pieces = part.trim().split(/\s+/);
+        .map((entry) => {
+          const parts = entry.trim().split(/\s+/);
 
-            if (!pieces[0]) {
-                return part;
-            }
+          if (!parts[0]) {
+            return entry;
+          }
 
-            pieces[0] = rewriteUrl(
-                pieces[0],
-                base,
-                "resource"
-            );
+          const target = absoluteUrl(
+            parts[0],
+            baseUrl
+          );
 
-            return pieces.join(" ");
+          if (!target) {
+            return entry;
+          }
+
+          parts[0] = proxyUrl(
+            origin,
+            "resource",
+            target
+          );
+
+          return parts.join(" ");
         })
         .join(", ");
+
+      return (
+        prefix +
+        quote +
+        rewritten +
+        quote
+      );
+    }
+  );
 }
 
-function rewriteCss(css, base) {
-    return css.replace(
-        /url\(\s*(['"]?)(.*?)\1\s*\)/gi,
-        (full, quote, value) => {
-            const v = value.trim();
+function rewriteCss(css, baseUrl, origin) {
+  css = css.replace(/@import\s+(["'])(.*?)\1/gi, (m, q, v) => {
+    const t = absoluteUrl(v, baseUrl);
+    return t ? '@import "' + proxyUrl(origin, "resource", t) + '"' : m;
+  });
 
-            if (
-                !v ||
-                v.startsWith("data:") ||
-                v.startsWith("blob:") ||
-                v.startsWith("#")
-            ) {
-                return full;
-            }
+  return css.replace(
+    /url\(\s*(["']?)(.*?)\1\s*\)/gis,
+    (match, quote, value) => {
+      const target = absoluteUrl(
+        value,
+        baseUrl
+      );
 
-            const absolute = absoluteUrl(v, base);
+      if (!target) {
+        return match;
+      }
 
-            if (!absolute) {
-                return full;
-            }
-
-            return `url("${proxyUrl(
-                absolute,
-                "resource"
-            )}")`;
-        }
-    );
+      return (
+        'url("' +
+        proxyUrl(
+          origin,
+          "resource",
+          target
+        ) +
+        '")'
+      );
+    }
+  );
 }
 
-function bridgeScript() {
-    return `
+function createBridge(origin) {
+  const endpoint =
+    origin + "/api/proxy";
+
+  return `
 <script>
 (function () {
-    const PROXY = "/api/proxy";
+  const ENDPOINT = ${JSON.stringify(endpoint)};
 
-    function isOwnProxy(url) {
-        try {
-            const u = new URL(url, document.baseURI);
-            return (
-                u.origin === location.origin &&
-                u.pathname === PROXY
-            );
-        } catch {
-            return false;
-        }
-    }
+  function ignored(url) {
+    return /^(data:|blob:|javascript:|mailto:|tel:|about:|#)/i
+      .test(String(url || ""));
+  }
 
-    function navigate(url) {
-        try {
-            const target = new URL(
-                url,
-                document.baseURI
-            ).href;
-
-            if (
-                window.parent &&
-                window.parent !== window
-            ) {
-                window.parent.postMessage(
-                    {
-                        type: "octavius:navigate",
-                        url: target
-                    },
-                    "*"
-                );
-
-                return;
-            }
-
-            location.href =
-                PROXY +
-                "?mode=frame&url=" +
-                encodeURIComponent(target);
-
-        } catch {}
-    }
-
-    document.addEventListener(
-        "click",
-        function (event) {
-            const link =
-                event.target.closest
-                    ? event.target.closest("a[href]")
-                    : null;
-
-            if (!link) return;
-            if (event.defaultPrevented) return;
-            if (event.button !== 0) return;
-
-            if (
-                event.ctrlKey ||
-                event.metaKey ||
-                event.shiftKey ||
-                event.altKey
-            ) {
-                return;
-            }
-
-            const href =
-                link.getAttribute("href");
-
-            if (!href) return;
-
-            if (
-                href.startsWith("#") ||
-                href.startsWith("javascript:") ||
-                href.startsWith("mailto:") ||
-                href.startsWith("tel:")
-            ) {
-                return;
-            }
-
-            event.preventDefault();
-            event.stopPropagation();
-
-            navigate(
-                new URL(
-                    href,
-                    document.baseURI
-                ).href
-            );
-        },
-        true
-    );
-
-    document.addEventListener(
-        "submit",
-        function (event) {
-            const form = event.target;
-
-            if (!(form instanceof HTMLFormElement)) {
-                return;
-            }
-
-            const method =
-                (form.method || "GET").toUpperCase();
-
-            if (method !== "GET") {
-                return;
-            }
-
-            event.preventDefault();
-            event.stopPropagation();
-
-            const target = new URL(
-                form.getAttribute("action") ||
-                location.href,
-                document.baseURI
-            );
-
-            const data = new FormData(form);
-
-            for (const [key, value] of data.entries()) {
-                target.searchParams.set(
-                    key,
-                    value
-                );
-            }
-
-            navigate(target.href);
-        },
-        true
-    );
-
-    const oldFetch = window.fetch;
-
-    if (oldFetch) {
-        window.fetch = function (input, init) {
-            try {
-                let url = null;
-
-                if (typeof input === "string") {
-                    url = input;
-                } else if (input && input.url) {
-                    url = input.url;
-                }
-
-                if (url && /^https?:\\/\\//i.test(url)) {
-                    if (!isOwnProxy(url)) {
-                        const target =
-                            new URL(
-                                url,
-                                document.baseURI
-                            );
-
-                        if (
-                            input instanceof Request
-                        ) {
-                            input = new Request(
-                                PROXY +
-                                "?mode=resource&url=" +
-                                encodeURIComponent(
-                                    target.href
-                                ),
-                                input
-                            );
-                        } else {
-                            input =
-                                PROXY +
-                                "?mode=resource&url=" +
-                                encodeURIComponent(
-                                    target.href
-                                );
-                        }
-                    }
-                }
-            } catch {}
-
-            return oldFetch.call(
-                this,
-                input,
-                init
-            );
-        };
-    }
-
-    const oldOpen =
-        XMLHttpRequest.prototype.open;
-
-    XMLHttpRequest.prototype.open =
-        function (
-            method,
-            url,
-            async,
-            user,
-            password
-        ) {
-            try {
-                if (
-                    typeof url === "string" &&
-                    /^https?:\\/\\//i.test(url) &&
-                    !isOwnProxy(url)
-                ) {
-                    const target =
-                        new URL(
-                            url,
-                            document.baseURI
-                        );
-
-                    url =
-                        PROXY +
-                        "?mode=resource&url=" +
-                        encodeURIComponent(
-                            target.href
-                        );
-                }
-            } catch {}
-
-            return oldOpen.call(
-                this,
-                method,
-                url,
-                async,
-                user,
-                password
-            );
-        };
-
-    const oldWindowOpen = window.open;
-
-    window.open = function (
+  function absolute(url) {
+    try {
+      return new URL(
         url,
-        target,
-        features
-    ) {
-        if (url) {
-            navigate(url);
-            return null;
+        document.baseURI
+      ).href;
+    } catch {
+      return null;
+    }
+  }
+
+  function proxify(url, mode = "resource") {
+    return (
+      ENDPOINT +
+      "?mode=" +
+      encodeURIComponent(mode) +
+      "&url=" +
+      encodeURIComponent(url) +
+      ${JSON.stringify(TOKEN ? "&k=" + TOKEN : "")}
+    );
+  }
+
+  function navigate(url) {
+    const target = absolute(url);
+
+    if (!target) return;
+
+    parent.postMessage(
+      {
+        type: "navigate",
+        url: target
+      },
+      "*"
+    );
+  }
+
+  document.addEventListener(
+    "click",
+    function (event) {
+      const link =
+        event.target &&
+        event.target.closest
+          ? event.target.closest("a[href]")
+          : null;
+
+      if (!link) return;
+
+      const href =
+        link.getAttribute("href");
+
+      if (!href || ignored(href)) {
+        return;
+      }
+
+      event.preventDefault();
+
+      navigate(href);
+    },
+    true
+  );
+
+  document.addEventListener(
+    "submit",
+    function (event) {
+      const form = event.target;
+
+      if (!form) return;
+
+      event.preventDefault();
+
+      if (form.querySelector('input[type="password"]')) {
+        parent.postMessage({ type: "blocked", reason: "Formulaire avec mot de passe bloqué" }, "*");
+        return;
+      }
+
+      try {
+        const target = new URL(
+          form.getAttribute("action") ||
+            document.baseURI,
+          document.baseURI
+        );
+
+        const data = new FormData(form);
+
+        for (const [key, value] of data.entries()) {
+          if (typeof value === "string") {
+            target.searchParams.append(
+              key,
+              value
+            );
+          }
         }
 
-        return oldWindowOpen.call(
-            window,
-            url,
+        navigate(target.href);
+      } catch {}
+    },
+    true
+  );
+
+  const originalFetch = window.fetch;
+
+  if (originalFetch) {
+    window.fetch = function(input, init) {
+      try {
+        const sourceUrl =
+          typeof input === "string"
+            ? input
+            : input && input.url;
+
+        const target = absolute(sourceUrl);
+
+        if (
+          target &&
+          /^https?:$/i.test(
+            new URL(target).protocol
+          )
+        ) {
+          const proxied = proxify(
             target,
-            features
-        );
+            "resource"
+          );
+
+          if (typeof input === "string") {
+            return originalFetch.call(
+              this,
+              proxied,
+              init
+            );
+          }
+
+          return originalFetch.call(
+            this,
+            new Request(
+              proxied,
+              input
+            ),
+            init
+          );
+        }
+      } catch {}
+
+      return originalFetch.call(
+        this,
+        input,
+        init
+      );
     };
+  }
+
+  const originalOpen =
+    XMLHttpRequest.prototype.open;
+
+  XMLHttpRequest.prototype.open =
+    function(method, url) {
+      try {
+        const target = absolute(url);
+
+        if (
+          target &&
+          /^https?:$/i.test(
+            new URL(target).protocol
+          )
+        ) {
+          url = proxify(
+            target,
+            "resource"
+          );
+        }
+      } catch {}
+
+      return originalOpen.apply(
+        this,
+        [
+          method,
+          url,
+          ...Array.prototype.slice.call(
+            arguments,
+            2
+          )
+        ]
+      );
+    };
+
 })();
 </script>
 `;
 }
 
-function escapeAttr(value) {
-    return String(value)
-        .replace(/&/g, "&amp;")
-        .replace(/"/g, "&quot;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
+function rewriteHtml(
+  html,
+  baseUrl,
+  origin
+) {
+  /*
+   * IMPORTANT :
+   * On retire les <base> existants.
+   * On n'en ajoute PAS un nouveau.
+   *
+   * Cela évite le bug :
+   * https://youtube.com/api/proxy
+   * au lieu de :
+   * https://emula-gold.vercel.app/api/proxy
+   */
+  html = html.replace(
+    /<base\b[^>]*>/gi,
+    ""
+  );
+
+  html = rewriteAttribute(
+    html,
+    "img",
+    "src",
+    baseUrl,
+    origin
+  );
+
+  html = rewriteAttribute(
+    html,
+    "script",
+    "src",
+    baseUrl,
+    origin
+  );
+
+  html = rewriteAttribute(
+    html,
+    "link",
+    "href",
+    baseUrl,
+    origin
+  );
+
+  html = rewriteAttribute(
+    html,
+    "source",
+    "src",
+    baseUrl,
+    origin
+  );
+
+  html = rewriteAttribute(
+    html,
+    "video",
+    "src",
+    baseUrl,
+    origin
+  );
+
+  html = rewriteAttribute(
+    html,
+    "audio",
+    "src",
+    baseUrl,
+    origin
+  );
+
+  html = rewriteAttribute(
+    html,
+    "embed",
+    "src",
+    baseUrl,
+    origin
+  );
+
+  html = rewriteAttribute(
+    html,
+    "object",
+    "data",
+    baseUrl,
+    origin
+  );
+
+  /*
+   * Les iframes doivent passer par le proxy
+   * pour éviter X-Frame-Options sur la cible.
+   */
+  html = rewriteAttribute(
+    html,
+    "iframe",
+    "src",
+    baseUrl,
+    origin,
+    "frame"
+  );
+
+  html = rewriteSrcset(
+    html,
+    "img",
+    baseUrl,
+    origin
+  );
+
+  html = rewriteSrcset(
+    html,
+    "source",
+    baseUrl,
+    origin
+  );
+
+  /*
+   * CSS inline.
+   */
+  html = html.replace(
+    /(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi,
+    (match, open, css, close) => {
+      return (
+        open +
+        rewriteCss(
+          css,
+          baseUrl,
+          origin
+        ) +
+        close
+      );
+    }
+  );
+
+  /*
+   * CSS dans style="..."
+   */
+  html = html.replace(
+    /(\bstyle\s*=\s*)(["'])(.*?)(\2)/gis,
+    (match, prefix, quote, value) => {
+      return (
+        prefix +
+        quote +
+        rewriteCss(
+          value,
+          baseUrl,
+          origin
+        ) +
+        quote
+      );
+    }
+  );
+
+  /*
+   * Supprime certaines protections HTML
+   * présentes dans la page proxifiée.
+   *
+   * Cela ne garantit pas que le site acceptera
+   * l'intégration, mais évite certains blocages
+   * simples.
+   */
+  html = html.replace(
+    /<meta[^>]+http-equiv\s*=\s*["']?\s*(?:content-security-policy|x-frame-options)\s*["']?[^>]*>/gi,
+    ""
+  );
+
+  /*
+   * Injecte le bridge AVANT </head>.
+   */
+  const bridge =
+    createBridge(origin);
+
+  if (/<head\b[^>]*>/i.test(html)) {
+    html = html.replace(
+      /(<head\b[^>]*>)/i,
+      "$1" + bridge
+    );
+  } else {
+    html =
+      bridge +
+      html;
+  }
+
+  return html;
 }
 
-function rewriteHtml(html, baseUrl) {
-    let output = html;
+async function fetchLimited(url, headers, maxBytes) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-    output = output.replace(
-        /<base\\b[^>]*>/gi,
-        ""
-    );
+  try {
+    let current = url;
 
-    output = output.replace(
-        /<meta\\b[^>]*http-equiv\\s*=\\s*["']?(?:content-security-policy|content-security-policy-report-only|x-frame-options)[^>]*>/gi,
-        ""
-    );
+    // Redirections suivies à la main : chaque étape est vérifiée
+    for (let hop = 0; hop <= 5; hop++) {
+      await checkPublicHost(new URL(current).hostname);
 
-    const baseTag =
-        `<base href="${escapeAttr(baseUrl)}">`;
+      const response = await fetch(current, {
+        method: "GET",
+        headers,
+        redirect: "manual",
+        signal: controller.signal
+      });
 
-    output = output.replace(
-        /<head\\b[^>]*>/i,
-        (match) => {
-            return (
-                match +
-                baseTag +
-                bridgeScript()
-            );
+      const location = response.headers.get("location");
+      if (response.status >= 300 && response.status < 400 && location) {
+        const next = new URL(location, current);
+        if (!["http:", "https:"].includes(next.protocol)) {
+          throw new Error("Redirection refusée");
         }
-    );
+        current = next.href;
+        continue;
+      }
 
-    output = output.replace(
-        /\\s(src|href|poster)\\s*=\\s*(["'])(.*?)\\2/gi,
-        (full, name, quote, value) => {
-            const rewritten =
-                rewriteUrl(
-                    value,
-                    baseUrl,
-                    "resource"
-                );
+      if (Number(response.headers.get("content-length") || 0) > maxBytes) {
+        throw new Error("Ressource trop volumineuse");
+      }
 
-            return (
-                " " +
-                name +
-                "=" +
-                quote +
-                rewritten +
-                quote
-            );
-        }
-    );
+      const chunks = [];
+      let total = 0;
+      for await (const chunk of response.body || []) {
+        total += chunk.length;
+        if (total > maxBytes) throw new Error("Ressource trop volumineuse");
+        chunks.push(chunk);
+      }
 
-    output = output.replace(
-        /\\ssrcset\\s*=\\s*(["'])(.*?)\\1/gi,
-        (full, quote, value) => {
-            return (
-                " srcset=" +
-                quote +
-                rewriteSrcset(
-                    value,
-                    baseUrl
-                ) +
-                quote
-            );
-        }
-    );
-
-    output = output.replace(
-        /(<style\\b[^>]*>)([\\s\\S]*?)(<\\/style>)/gi,
-        (full, open, css, close) => {
-            return (
-                open +
-                rewriteCss(css, baseUrl) +
-                close
-            );
-        }
-    );
-
-    return output;
-}
-
-async function readBody(req) {
-    if (
-        req.body !== undefined &&
-        req.body !== null
-    ) {
-        if (Buffer.isBuffer(req.body)) {
-            return req.body;
-        }
-
-        if (typeof req.body === "string") {
-            return Buffer.from(req.body);
-        }
-
-        if (
-            typeof req.body === "object"
-        ) {
-            return Buffer.from(
-                JSON.stringify(req.body)
-            );
-        }
+      return { response, buffer: Buffer.concat(chunks), finalUrl: current };
     }
 
-    if (
-        !req.readable ||
-        typeof req.on !== "function"
-    ) {
-        return null;
-    }
-
-    return await new Promise(
-        (resolve, reject) => {
-            const chunks = [];
-
-            req.on(
-                "data",
-                (chunk) => {
-                    chunks.push(
-                        Buffer.from(chunk)
-                    );
-                }
-            );
-
-            req.on(
-                "end",
-                () => {
-                    resolve(
-                        chunks.length
-                            ? Buffer.concat(chunks)
-                            : null
-                    );
-                }
-            );
-
-            req.on(
-                "error",
-                reject
-            );
-        }
-    );
+    throw new Error("Trop de redirections");
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 module.exports = async function handler(
-    req,
-    res
+  req,
+  res
 ) {
+  /*
+   * CORS / OPTIONS
+   */
+  if (req.method === "OPTIONS") {
+    res.setHeader(
+      "Access-Control-Allow-Origin",
+      "*"
+    );
+
+    res.setHeader(
+      "Access-Control-Allow-Methods",
+      "GET,OPTIONS"
+    );
+
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "*"
+    );
+
+    return res.status(204).end();
+  }
+
+  try {
+    if (String(req.query?.mode) === "auth") {
+      if (!TOKEN) {
+        checkAccess(req);
+        return res.status(200).json({ needsCode: false });
+      }
+      if (req.query?.code !== undefined) {
+        if (sameToken(tokenFor(String(req.query.code)), TOKEN)) {
+          return res.status(200).json({ ok: true, k: TOKEN });
+        }
+        await new Promise((r) => setTimeout(r, 800));
+        throw httpError(401, "Code incorrect");
+      }
+      return res.status(200).json({
+        needsCode: true,
+        valid: sameToken(String(req.query?.k || ""), TOKEN)
+      });
+    }
+
+    checkAccess(req);
+
+    const rawUrl =
+      Array.isArray(req.query?.url)
+        ? req.query.url[0]
+        : req.query?.url;
+
+    const mode =
+      String(
+        req.query?.mode ||
+          "document"
+      );
+
+    if (!rawUrl) {
+      return res.status(400).json({
+        erreur:
+          "Paramètre url manquant"
+      });
+    }
+
+    if (
+      ![
+        "document",
+        "frame",
+        "resource"
+      ].includes(mode)
+    ) {
+      return res.status(400).json({
+        erreur:
+          "Mode invalide"
+      });
+    }
+
+    let target;
+
     try {
-        setCors(req, res);
+      target = new URL(rawUrl);
+    } catch {
+      return res.status(400).json({
+        erreur:
+          "URL invalide"
+      });
+    }
 
-        if (req.method === "OPTIONS") {
-            res.statusCode = 204;
-            return res.end();
-        }
+    if (
+      !["http:", "https:"].includes(
+        target.protocol
+      )
+    ) {
+      return res.status(400).json({
+        erreur:
+          "Seuls HTTP et HTTPS sont autorisés"
+      });
+    }
 
-        const rawUrl =
-            req.query &&
-            typeof req.query.url === "string"
-                ? req.query.url
-                : null;
+    await checkPublicHost(
+      target.hostname
+    );
 
-        const mode =
-            req.query &&
-            typeof req.query.mode === "string"
-                ? req.query.mode
-                : "resource";
+    const protocol =
+      String(req.headers["x-forwarded-proto"] || (/^(localhost|127\.)/.test(String(req.headers["x-forwarded-host"] || req.headers.host || "")) ? "http" : "https"));
 
-        if (!rawUrl) {
-            res.statusCode = 400;
-            res.setHeader(
-                "Content-Type",
-                "application/json; charset=utf-8"
-            );
+    const forwardedHost =
+      String(
+        req.headers["x-forwarded-host"] ||
+          req.headers.host ||
+          ""
+      );
 
-            return res.end(
-                JSON.stringify({
-                    error: "URL manquante"
-                })
-            );
-        }
+    const origin =
+      forwardedHost
+        ? protocol +
+          "://" +
+          forwardedHost
+        : "";
 
-        let target;
+    const headers = {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140 Safari/537.36",
 
-        try {
-            target = new URL(rawUrl);
-        } catch {
-            res.statusCode = 400;
-            res.setHeader(
-                "Content-Type",
-                "application/json; charset=utf-8"
-            );
+      "Accept-Language":
+        "fr-FR,fr;q=0.9,en;q=0.8",
 
-            return res.end(
-                JSON.stringify({
-                    error: "URL invalide"
-                })
-            );
-        }
+      "Accept":
+        mode === "document" ||
+        mode === "frame"
+          ? "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+          : "*/*",
 
-        if (
-            target.protocol !== "http:" &&
-            target.protocol !== "https:"
-        ) {
-            res.statusCode = 400;
+      "Referer":
+        target.origin + "/"
+    };
 
-            return res.end(
-                JSON.stringify({
-                    error: "Protocole interdit"
-                })
-            );
-        }
+    const result =
+      await fetchLimited(
+        target.href,
+        headers,
+        mode === "document" ||
+        mode === "frame"
+          ? MAX_DOCUMENT_SIZE
+          : MAX_RESOURCE_SIZE
+      );
 
-        await checkHost(
-            target.hostname
+    const upstream =
+      result.response;
+
+    const buffer =
+      result.buffer;
+
+    const finalUrl =
+      new URL(result.finalUrl);
+
+    await checkPublicHost(
+      finalUrl.hostname
+    );
+
+    const contentType =
+      upstream.headers.get(
+        "content-type"
+      ) ||
+      "application/octet-stream";
+
+    /*
+     * ==========================================
+     * DOCUMENT / FRAME
+     * ==========================================
+     */
+
+    if (
+      mode === "document" ||
+      mode === "frame"
+    ) {
+      if (
+        !/html|xhtml/i.test(
+          contentType
+        )
+      ) {
+        return res.status(415).json({
+          erreur:
+            "La cible ne renvoie pas une page HTML",
+          contentType
+        });
+      }
+
+      const html =
+        rewriteHtml(
+          buffer.toString("utf8"),
+          finalUrl.href,
+          origin
         );
 
-        const method =
-            (req.method || "GET").toUpperCase();
+      res.setHeader(
+        "Access-Control-Allow-Origin",
+        "*"
+      );
 
-        let body = undefined;
+      res.setHeader(
+        "Cache-Control",
+        "no-store"
+      );
 
-        if (
-            method === "POST" ||
-            method === "PUT" ||
-            method === "PATCH"
-        ) {
-            body = await readBody(req);
-        }
+      /*
+       * On ne renvoie PAS :
+       * X-Frame-Options
+       * CSP de la cible
+       *
+       * car ces en-têtes seraient ceux
+       * du site distant, pas ceux d'Octavius.
+       */
 
-        const headers = {};
-
-        const allowedHeaders = [
-            "accept",
-            "accept-language",
-            "content-type",
-            "user-agent",
-            "referer"
-        ];
-
-        for (const name of allowedHeaders) {
-            const value =
-                req.headers?.[name];
-
-            if (value) {
-                headers[name] = value;
-            }
-        }
-
-        const fetchOptions = {
-            method,
-            headers,
-            redirect: "follow"
-        };
-
-        if (body !== undefined) {
-            fetchOptions.body = body;
-        }
-
-        const upstream = await fetch(
-            target.href,
-            fetchOptions
-        );
-
-        let contentType =
-            upstream.headers.get(
-                "content-type"
-            ) ||
-            "application/octet-stream";
-
-        let output;
-
-        if (
-            (mode === "frame" ||
-                mode === "document") &&
-            contentType.includes("text/html")
-        ) {
-            const html =
-                await upstream.text();
-
-            output = rewriteHtml(
-                html,
-                target.href
-            );
-
-            contentType =
-                "text/html; charset=utf-8";
-        } else if (
-            contentType.includes(
-                "text/css"
-            )
-        ) {
-            const css =
-                await upstream.text();
-
-            output = rewriteCss(
-                css,
-                target.href
-            );
-
-            contentType =
-                "text/css; charset=utf-8";
-        } else {
-            output =
-                Buffer.from(
-                    await upstream.arrayBuffer()
-                );
-        }
-
-        res.statusCode =
-            upstream.status;
-
-        for (
-            const [
-                key,
-                value
-            ] of upstream.headers.entries()
-        ) {
-            const lower =
-                key.toLowerCase();
-
-            if (
-                BLOCKED_HEADERS.has(lower)
-            ) {
-                continue;
-            }
-
-            if (
-                lower === "content-length" ||
-                lower === "content-encoding" ||
-                lower === "transfer-encoding" ||
-                lower === "set-cookie"
-            ) {
-                continue;
-            }
-
-            if (lower === "location") {
-                const absolute =
-                    absoluteUrl(
-                        value,
-                        target.href
-                    );
-
-                if (absolute) {
-                    res.setHeader(
-                        "Location",
-                        proxyUrl(
-                            absolute,
-                            "frame"
-                        )
-                    );
-                }
-
-                continue;
-            }
-
-            try {
-                res.setHeader(
-                    key,
-                    value
-                );
-            } catch {}
-        }
-
+      if (mode === "frame") {
         res.setHeader(
-            "Content-Type",
-            contentType
+          "Content-Type",
+          "text/html; charset=utf-8"
         );
 
-        res.setHeader(
-            "Cache-Control",
-            "no-store"
-        );
+        return res
+          .status(upstream.status)
+          .send(html);
+      }
 
-        res.removeHeader(
-            "X-Frame-Options"
-        );
+      /*
+       * Mode document :
+       * renvoie du JSON au frontend.
+       */
+      res.setHeader(
+        "Content-Type",
+        "application/json; charset=utf-8"
+      );
 
-        res.removeHeader(
-            "Content-Security-Policy"
-        );
+      return res
+        .status(upstream.status)
+        .json({
+          statut:
+            upstream.status,
 
-        if (Buffer.isBuffer(output)) {
-            return res.end(output);
-        }
+          url:
+            finalUrl.href,
 
-        return res.end(output);
-    } catch (error) {
-        console.error(
-            "OCTAVIUS_PROXY_ERROR:",
-            error
-        );
+          html
+        });
+    }
 
-        res.statusCode = 502;
+    /*
+     * ==========================================
+     * RESOURCE
+     * ==========================================
+     */
 
-        res.setHeader(
-            "Content-Type",
-            "application/json; charset=utf-8"
-        );
+    let output = buffer;
 
-        return res.end(
-            JSON.stringify({
-                error: "Proxy error",
-                message:
-                    error?.message ||
-                    "Erreur inconnue"
-            })
+    if (
+      /text\/css/i.test(
+        contentType
+      )
+    ) {
+      output =
+        Buffer.from(
+          rewriteCss(
+            buffer.toString("utf8"),
+            finalUrl.href,
+            origin
+          ),
+          "utf8"
         );
     }
+
+    res.setHeader(
+      "Access-Control-Allow-Origin",
+      "*"
+    );
+
+    res.setHeader(
+      "Cache-Control",
+      "public, max-age=300"
+    );
+
+    res.setHeader(
+      "Content-Type",
+      contentType.split(";")[0] ||
+        "application/octet-stream"
+    );
+
+    res.setHeader(
+      "X-Content-Type-Options",
+      "nosniff"
+    );
+
+    return res
+      .status(upstream.status)
+      .send(output);
+
+  } catch (error) {
+    console.error(
+      "Octavius proxy error:",
+      error
+    );
+
+    const message =
+      error?.name === "AbortError"
+        ? "Le site a mis trop de temps à répondre."
+        : String(
+            error?.message ||
+              error
+          );
+
+    return res.status(error?.status || 502).json({
+      erreur: message
+    });
+  }
 };
