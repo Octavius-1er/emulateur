@@ -3,13 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
   <title>Octavius</title>
 
   <style>
     :root {
       color-scheme: dark;
 
-      --bg: #0f172a;
+      --background: #0f172a;
       --toolbar: #172033;
       --toolbar-border: #2d3a52;
       --input: #0b1220;
@@ -34,9 +35,10 @@
     body {
       display: flex;
       flex-direction: column;
+
       overflow: hidden;
 
-      background: var(--bg);
+      background: var(--background);
       color: var(--text);
 
       font-family:
@@ -48,15 +50,16 @@
     }
 
     /* =========================
-       BARRE DE NAVIGATION
+       BARRE DU NAVIGATEUR
        ========================= */
 
-    .toolbar {
+    .browser-bar {
       display: flex;
       align-items: center;
       gap: 8px;
 
       min-height: 58px;
+
       padding: 8px 10px;
 
       background: var(--toolbar);
@@ -69,11 +72,11 @@
       gap: 4px;
     }
 
-    button {
+    .browser-button {
       width: 38px;
       height: 38px;
 
-      border: 0;
+      border: none;
       border-radius: 50%;
 
       background: transparent;
@@ -88,11 +91,11 @@
         opacity 0.15s ease;
     }
 
-    button:hover:not(:disabled) {
+    .browser-button:hover:not(:disabled) {
       background: var(--hover);
     }
 
-    button:disabled {
+    .browser-button:disabled {
       opacity: 0.3;
       cursor: default;
     }
@@ -103,7 +106,9 @@
 
     .address-wrapper {
       flex: 1;
-      min-width: 0;
+
+      display: flex;
+      align-items: center;
     }
 
     #address {
@@ -125,7 +130,6 @@
 
     #address:focus {
       border-color: var(--accent);
-      box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.12);
     }
 
     #address::placeholder {
@@ -133,7 +137,7 @@
     }
 
     /* =========================
-       PROGRESSION
+       BARRE DE CHARGEMENT
        ========================= */
 
     #progress {
@@ -159,9 +163,9 @@
       width: 100%;
       height: 100%;
 
-      border: 0;
+      border: none;
 
-      background: #fff;
+      background: white;
     }
 
     /* =========================
@@ -176,6 +180,7 @@
       gap: 10px;
 
       min-height: 30px;
+
       padding: 5px 10px;
 
       background: #141d2d;
@@ -188,8 +193,6 @@
 
     #status {
       flex: 1;
-
-      min-width: 0;
 
       overflow: hidden;
 
@@ -210,13 +213,15 @@
        ========================= */
 
     @media (max-width: 700px) {
-      .toolbar {
+      .browser-bar {
+        min-height: 110px;
+
         flex-wrap: wrap;
-        min-height: 108px;
       }
 
       .buttons {
         width: 100%;
+
         justify-content: center;
       }
 
@@ -224,18 +229,74 @@
         width: 100%;
       }
     }
+  [hidden] { display: none !important; }
+
+    #youtube-frame {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      border: none;
+      background: #000;
+    }
+
+    #login {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(15, 23, 42, 0.97);
+    }
+
+    .login-box {
+      width: min(340px, 90vw);
+      padding: 24px;
+      border: 1px solid var(--toolbar-border);
+      border-radius: 12px;
+      background: var(--toolbar);
+    }
+
+    .login-box h2 { margin: 0 0 8px; }
+    .login-box p { margin: 0 0 12px; color: var(--muted); }
+
+    .login-box input {
+      width: 100%;
+      height: 40px;
+      margin-bottom: 10px;
+      padding: 0 14px;
+      border: 1px solid #344158;
+      border-radius: 8px;
+      background: var(--input);
+      color: var(--text);
+      font-size: 15px;
+    }
+
+    .login-box button {
+      width: 100%;
+      height: 40px;
+      border: 0;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    #login-error { margin-top: 10px; color: var(--error); min-height: 1em; }
   </style>
 </head>
 
 <body>
 
   <!-- =========================
-       BARRE DE NAVIGATION
+       BARRE DU NAVIGATEUR
        ========================= -->
 
   <form
     id="navigation-form"
-    class="toolbar"
+    class="browser-bar"
     autocomplete="off"
   >
 
@@ -243,6 +304,7 @@
 
       <button
         id="back"
+        class="browser-button"
         type="button"
         title="Précédent"
         disabled
@@ -252,6 +314,7 @@
 
       <button
         id="forward"
+        class="browser-button"
         type="button"
         title="Suivant"
         disabled
@@ -261,6 +324,7 @@
 
       <button
         id="reload"
+        class="browser-button"
         type="button"
         title="Recharger"
       >
@@ -269,6 +333,7 @@
 
       <button
         id="home"
+        class="browser-button"
         type="button"
         title="Accueil"
       >
@@ -282,10 +347,9 @@
       <input
         id="address"
         type="text"
-        placeholder="Adresse ou recherche..."
+        placeholder="Entrez une adresse ou recherchez..."
         spellcheck="false"
         autocomplete="off"
-        autofocus
       >
 
     </div>
@@ -293,7 +357,7 @@
   </form>
 
   <!-- =========================
-       BARRE DE CHARGEMENT
+       CHARGEMENT
        ========================= -->
 
   <div id="progress"></div>
@@ -305,16 +369,7 @@
   <iframe
     id="browser-frame"
     title="Octavius Browser"
-
-    sandbox="
-      allow-scripts
-      allow-forms
-      allow-popups
-      allow-modals
-      allow-presentation
-      allow-downloads
-    "
-
+    sandbox="allow-scripts allow-forms allow-presentation"
     allow="
       autoplay;
       fullscreen;
@@ -323,6 +378,15 @@
       clipboard-read;
       clipboard-write
     "
+  ></iframe>
+
+  <iframe
+    id="youtube-frame"
+    hidden
+    title="Lecteur YouTube"
+    referrerpolicy="strict-origin-when-cross-origin"
+    allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
+    allowfullscreen
   ></iframe>
 
   <!-- =========================
@@ -344,6 +408,16 @@
   <!-- =========================
        JAVASCRIPT
        ========================= -->
+
+  <form id="login" hidden>
+    <div class="login-box">
+      <h2>Accès protégé</h2>
+      <p>Entre le code d'accès.</p>
+      <input id="login-code" type="password" autocomplete="off" aria-label="Code d'accès">
+      <button type="submit">Entrer</button>
+      <p id="login-error" role="alert"></p>
+    </div>
+  </form>
 
   <script src="/script.js" defer></script>
 
